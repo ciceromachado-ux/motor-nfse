@@ -4,6 +4,7 @@
 // junto com a resposta.
 
 import http from "node:http";
+import https from "node:https";
 import { timingSafeEqual } from "node:crypto";
 import { readCertificate } from "./cert.js";
 import { signXmlElement } from "./dsign.js";
@@ -75,6 +76,7 @@ async function handleSign(payload) {
     digestAlgorithm: payload.digest_algorithm,
     signatureAlgorithm: payload.signature_algorithm,
   });
+  // Não devolve XML que a prefeitura ia recusar.
   const check = verifySignedXml(signed, { targetTag: payload.target_tag });
   if (!check.valid) {
     throw new Error(`A assinatura não conferiu: ${check.errors.join(" ")}`);
@@ -153,7 +155,41 @@ async function handleEmitir(payload) {
   };
 }
 
+// Repasse HTTPS genérico com certificado (mTLS): usado pelo app para falar
+// com a Sefin Nacional/ADN, que exigem renegociação TLS que o app não faz.
+const ALLOWED_HOSTS = /(^|\.)(nfse\.gov\.br|sefin\.nfse\.gov\.br|adn\.nfse\.gov\.br)$/i;
+async function handleRelay(payload) {
+  const cert = certificateFrom(payload);
+  const target = new URL(String(payload.url || ""));
+  if (target.protocol !== "https:" || !ALLOWED_HOSTS.test(target.hostname)) {
+    throw new Error("Destino não permitido.");
+  }
+  const method = String(payload.method || "GET").toUpperCase();
+  const body = payload.body_base64 ? Buffer.from(String(payload.body_base64), "base64") : null;
+  const agent = new https.Agent({ pfx: cert.pfx, passphrase: String(payload.certificate_passphrase ?? "") });
+  return await new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: target.hostname, port: target.port || 443, path: target.pathname + target.search,
+      method, agent,
+      headers: { ...(payload.headers || {}), ...(body ? { "Content-Length": body.length } : {}) },
+    }, (r) => {
+      const chunks = [];
+      r.on("data", (c) => chunks.push(c));
+      r.on("end", () => resolve({
+        status_code: r.statusCode ?? 0,
+        content_type: String(r.headers["content-type"] || ""),
+        body_base64: Buffer.concat(chunks).toString("base64"),
+      }));
+    });
+    req.setTimeout(Number(payload.timeout_ms) || 60000, () => req.destroy(new Error("Tempo esgotado ao falar com a Sefin.")));
+    req.on("error", (e) => reject(new Error(`Falha na conexão com certificado: ${e.message}`)));
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
 const routes = {
+  "POST /relay": handleRelay,
   "POST /sign": handleSign,
   "POST /transmit": handleTransmit,
   "POST /emitir": handleEmitir,
@@ -181,6 +217,6 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
+  // PORT=0 deixa o sistema escolher: informe a porta realmente em uso.
   console.log(`ponte de NFS-e ouvindo na porta ${server.address().port}`);
 });
-
